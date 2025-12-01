@@ -1,5 +1,5 @@
 /*
-   G27 SHIFTER ONLY → ESP32 Thing Plus (Bluetooth LE Gamepad)
+   Logitech (G27?) SHIFTER ONLY → ESP32 Thing Plus (Bluetooth LE Gamepad)
    ----------------------------------------------------------
    - Only H-pattern shifter + push-down reverse button
    - BLE exposes:
@@ -23,7 +23,7 @@
 // ------------------------
 // BLE Gamepad config
 // ------------------------
-BleGamepad bleGamepad("G27 Shifter ESP32", "DIY", 100);
+BleGamepad bleGamepad("Logitech Shifter", "DIY", 100);
 
 // 1–6 = gears, 7 = reverse
 enum GamepadButtons {
@@ -137,7 +137,7 @@ void updateGamepadGear(int newGear) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Starting G27 Shifter-only BLE HID...");
+  Serial.println("Starting Shifter-only BLE HID...");
 
   pinMode(REVERSE_PIN, INPUT_PULLUP);  // assume switch to GND when pressed
 
@@ -147,7 +147,7 @@ void setup() {
   config.setAutoReport(true);
   bleGamepad.begin(&config);
 
-  Serial.println("Pair as: 'G27 Shifter ESP32'");
+  Serial.println("Pair as: 'Shifter ESP32'");
 }
 
 void loop() {
