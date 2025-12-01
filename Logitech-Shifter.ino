@@ -1,31 +1,39 @@
 /*
    Logitech (G27?) SHIFTER ONLY → ESP32 Thing Plus (Bluetooth LE Gamepad)
-   ----------------------------------------------------------
-   - Only H-pattern shifter + push-down reverse button
-   - BLE exposes:
-       * Button 1–6 = gears 1–6
-       * Button 7   = Reverse (6th gear + reverse button)
+
+   Hardware:
+     - Shifter header: SCK, MISO, CS, X, Y, 3.3V, GND
+     - ESP32 Thing Plus C
+
+   Behavior:
+     - X/Y → detect gears 1–6
+     - Shift-register (SCK/MISO/CS) → reverse push-down
+     - BLE Gamepad buttons:
+         1–6 = gears 1–6
+         7   = Reverse (6th + reverse pressed)
 */
 
 #include <Arduino.h>
 #include <BleGamepad.h>
+#include "Filter.h"   // median filter
 
 // ------------------------
-// PIN ASSIGNMENTS
+// PIN ASSIGNMENTS (ESP32 Thing Plus)
 // ------------------------
-// Analog axes from shifter pots
-#define SHIFTER_X_PIN   32   // X-axis wiper (left–right)
-#define SHIFTER_Y_PIN   33   // Y-axis wiper (forward–back)
+#define SHIFTER_CLOCK_PIN  13   // SCK from shifter
+#define SHIFTER_DATA_PIN   12   // MISO from shifter
+#define SHIFTER_MODE_PIN   14   // CS / !PL from shifter
 
-// Single reverse button (push-down)
-#define REVERSE_PIN     27   // digital input, to reverse microswitch
+#define SHIFTER_X_PIN      32   // X-axis ADC
+#define SHIFTER_Y_PIN      33   // Y-axis ADC
+
+#define BUTTON_REVERSE     1    // reverse push-down bit index
 
 // ------------------------
-// BLE Gamepad config
+// BLE CONFIG
 // ------------------------
 BleGamepad bleGamepad("Logitech Shifter", "DIY", 100);
 
-// 1–6 = gears, 7 = reverse
 enum GamepadButtons {
   GP_GEAR_1   = 1,
   GP_GEAR_2   = 2,
@@ -39,64 +47,76 @@ enum GamepadButtons {
 const int GAMEPAD_BUTTON_COUNT = 7;
 
 // ------------------------
-// ANALOG THRESHOLDS
-// (tune these to your hardware)
+// ANALOG THRESHOLDS (BASED ON YOUR DATA)
 // ------------------------
-// ADC is 0–4095. Start with these, then adjust
-// after you log values in Serial Monitor.
-int Y_TOP_THRESHOLD    = 2900;   // above this = top row (1,3,5)
-int Y_BOTTOM_THRESHOLD = 1200;   // below this = bottom row (2,4,6)
+// Y: bottom ~0, neutral ~1575, top ~3200–3450
+int Y_TOP_THRESHOLD    = 2400;   // above this = top row (1,3,5)
+int Y_BOTTOM_THRESHOLD = 800;    // below this = bottom row (2,4,6)
 
-// left / mid / right gates
-int X_LEFT_THRESHOLD   = 1300;   // left gate (1/2)
-int X_RIGHT_THRESHOLD  = 2800;   // right gate (5/6/R)
+// X: left ~610, neutral ~1450, right ~2170–2200
+// lowered left threshold so 3/4 don't flip to 1/2 when you lean left
+int X_LEFT_THRESHOLD   = 900;    // left gate (1/2) – moved further left
+int X_RIGHT_THRESHOLD  = 1900;   // right gate (5/6/R)
+
+// ------------------------
+// FILTERS
+// ------------------------
+SignalFilter filterX;
+SignalFilter filterY;
 
 // ------------------------
 // STATE
 // ------------------------
-int currentGear = 0;   // 0 = neutral, 1–6, 7 = reverse
+int currentGear = 0;   // 0=N, 1–6, 7=R
 int prevGear    = 0;
 
 // ------------------------
 // HELPERS
 // ------------------------
-int readAxisAveraged(int pin, int samples = 8) {
-  long sum = 0;
-  for (int i = 0; i < samples; ++i) {
-    sum += analogRead(pin);
-    delayMicroseconds(200);
-  }
-  return (int)(sum / samples);
+static inline void settle() {
+  delayMicroseconds(5);
 }
 
-// Determine gear from X/Y only (no reverse logic yet)
-int detectBaseGear(int xRaw, int yRaw) {
-  // Neutral if within mid Y-band
-  if (yRaw <= Y_TOP_THRESHOLD && yRaw >= Y_BOTTOM_THRESHOLD) {
-    return 0;
+void getButtonStates(int *ret) {
+  digitalWrite(SHIFTER_MODE_PIN, LOW);   // latch
+  settle();
+  digitalWrite(SHIFTER_MODE_PIN, HIGH);  // shift mode
+
+  for (int i = 0; i < 16; i++) {
+    digitalWrite(SHIFTER_CLOCK_PIN, LOW);
+    settle();
+    ret[i] = digitalRead(SHIFTER_DATA_PIN);
+    digitalWrite(SHIFTER_CLOCK_PIN, HIGH);
+    settle();
+  }
+}
+
+int readAxisFiltered(uint8_t pin, SignalFilter &filter) {
+  uint16_t raw = analogRead(pin);
+  uint16_t filtered = apply_filter(&filter, 9, raw);  // 9-sample median
+  return (int)filtered;
+}
+
+int detectBaseGear(int x, int y) {
+  // Neutral band in Y
+  if (y <= Y_TOP_THRESHOLD && y >= Y_BOTTOM_THRESHOLD)
+    return 0; // NEUTRAL
+
+  if (y > Y_TOP_THRESHOLD) {
+    // Top row: 1, 3, 5
+    if (x < X_LEFT_THRESHOLD)       return 1;
+    else if (x > X_RIGHT_THRESHOLD) return 5;
+    else                            return 3;
   }
 
-  if (yRaw > Y_TOP_THRESHOLD) {
-    // Top row: 1,3,5
-    if (xRaw < X_LEFT_THRESHOLD) {
-      return 1;   // 1st
-    } else if (xRaw > X_RIGHT_THRESHOLD) {
-      return 5;   // 5th
-    } else {
-      return 3;   // 3rd
-    }
-  } else if (yRaw < Y_BOTTOM_THRESHOLD) {
-    // Bottom row: 2,4,6
-    if (xRaw < X_LEFT_THRESHOLD) {
-      return 2;   // 2nd
-    } else if (xRaw > X_RIGHT_THRESHOLD) {
-      return 6;   // 6th (R is a “mode” of this)
-    } else {
-      return 4;   // 4th
-    }
+  if (y < Y_BOTTOM_THRESHOLD) {
+    // Bottom row: 2, 4, 6
+    if (x < X_LEFT_THRESHOLD)       return 2;
+    else if (x > X_RIGHT_THRESHOLD) return 6;
+    else                            return 4;
   }
 
-  return 0; // fallback neutral
+  return 0;
 }
 
 void updateGamepadGear(int newGear) {
@@ -104,91 +124,59 @@ void updateGamepadGear(int newGear) {
 
   // release previous
   if (prevGear > 0) {
-    switch (prevGear) {
-      case 1: bleGamepad.release(GP_GEAR_1); break;
-      case 2: bleGamepad.release(GP_GEAR_2); break;
-      case 3: bleGamepad.release(GP_GEAR_3); break;
-      case 4: bleGamepad.release(GP_GEAR_4); break;
-      case 5: bleGamepad.release(GP_GEAR_5); break;
-      case 6: bleGamepad.release(GP_GEAR_6); break;
-      case 7: bleGamepad.release(GP_REVERSE); break;
-    }
+    uint8_t btn = (prevGear == 7 ? GP_REVERSE : GP_GEAR_1 + (prevGear - 1));
+    bleGamepad.release(btn);
   }
 
   // press new
   if (newGear > 0) {
-    switch (newGear) {
-      case 1: bleGamepad.press(GP_GEAR_1); break;
-      case 2: bleGamepad.press(GP_GEAR_2); break;
-      case 3: bleGamepad.press(GP_GEAR_3); break;
-      case 4: bleGamepad.press(GP_GEAR_4); break;
-      case 5: bleGamepad.press(GP_GEAR_5); break;
-      case 6: bleGamepad.press(GP_GEAR_6); break;
-      case 7: bleGamepad.press(GP_REVERSE); break;
-    }
+    uint8_t btn = (newGear == 7 ? GP_REVERSE : GP_GEAR_1 + (newGear - 1));
+    bleGamepad.press(btn);
   }
 
   prevGear = newGear;
 }
 
 // ------------------------
-// SETUP / LOOP
+// SETUP
 // ------------------------
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("Starting Shifter-only BLE HID...");
+  pinMode(SHIFTER_MODE_PIN, OUTPUT);
+  pinMode(SHIFTER_CLOCK_PIN, OUTPUT);
+  pinMode(SHIFTER_DATA_PIN, INPUT_PULLUP);
 
-  pinMode(REVERSE_PIN, INPUT_PULLUP);  // assume switch to GND when pressed
+  digitalWrite(SHIFTER_MODE_PIN, HIGH);
+  digitalWrite(SHIFTER_CLOCK_PIN, HIGH);
 
-  // configure BLE gamepad
   BleGamepadConfiguration config;
   config.setButtonCount(GAMEPAD_BUTTON_COUNT);
   config.setAutoReport(true);
   bleGamepad.begin(&config);
-
-  Serial.println("Pair as: 'Shifter ESP32'");
 }
 
+// ------------------------
+// LOOP
+// ------------------------
 void loop() {
-  // Read analogs
-  int xRaw = readAxisAveraged(SHIFTER_X_PIN);
-  int yRaw = readAxisAveraged(SHIFTER_Y_PIN);
+  int buttonStates[16];
+  getButtonStates(buttonStates);
 
-  // Read reverse button (active LOW)
-  bool reversePressed = (digitalRead(REVERSE_PIN) == LOW);
+  int  revRaw         = buttonStates[BUTTON_REVERSE];
+  bool reversePressed = (revRaw == 1);   // 6 = 6, 6 + push-down = R
 
-  int baseGear = detectBaseGear(xRaw, yRaw);
+  int xFilt = readAxisFiltered(SHIFTER_X_PIN, filterX);
+  int yFilt = readAxisFiltered(SHIFTER_Y_PIN, filterY);
+
+  int baseGear = detectBaseGear(xFilt, yFilt);
   int newGear  = baseGear;
 
-  // If in 6th gate and reverse pushed, treat it as Reverse (7)
-  if (baseGear == 6 && reversePressed) {
+  if (baseGear == 6 && reversePressed)
     newGear = 7;
-  }
 
   if (newGear != currentGear) {
     currentGear = newGear;
     updateGamepadGear(currentGear);
   }
 
-  // Debug
-  static unsigned long lastPrint = 0;
-  unsigned long now = millis();
-  if (now - lastPrint > 250) {
-    lastPrint = now;
-    Serial.print("X=");
-    Serial.print(xRaw);
-    Serial.print("  Y=");
-    Serial.print(yRaw);
-    Serial.print("  base=");
-    Serial.print(baseGear);
-    Serial.print("  gear=");
-    Serial.print(currentGear);
-    Serial.print("  revBtn=");
-    Serial.print(reversePressed ? "1" : "0");
-    Serial.print("  BLE=");
-    Serial.println(bleGamepad.isConnected() ? "ON" : "OFF");
-  }
-
-  delay(5);
+  // No delay → high polling rate
 }
